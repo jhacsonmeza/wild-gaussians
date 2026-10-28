@@ -216,55 +216,60 @@ def load_colmap_dataset(path: Union[Path, str],
         test_indices: Optional[Indices] = None,
         features: Optional[FrozenSet[DatasetFeature]] = None,
         colmap_path: Optional[Union[str, Path]] = None):
-    path = Path(path)
+    path = Path(path) if path is not None else None
     colmap_path = Path(colmap_path) if colmap_path is not None else None
+    images_path = Path(images_path) if images_path is not None else None
+
     if features is None:
         features = typing.cast(FrozenSet[DatasetFeature], {})
     load_points = "points3D_xyz" in features or "points3D_rgb" in features
+
     if split:
         assert split in {"train", "test"}
+
     # Load COLMAP dataset
-    if colmap_path is None:
+    if colmap_path is None and images_path is None:
         colmap_path = Path("sparse") / "0"
         if not (path / colmap_path).exists():
             colmap_path = Path("sparse")
-    colmap_path = path / colmap_path
-    if images_path is None:
+        colmap_path = path / colmap_path
+
         images_path = Path("images")
-    images_path = path / images_path
+        images_path = path / images_path
+
     if not colmap_path.exists():
-        raise DatasetNotFoundError("Missing 'sparse/0' folder in COLMAP dataset")
+        raise DatasetNotFoundError(f"COLMAP path {colmap_path} doesn't exists")
     if not (colmap_path / "cameras.bin").exists() and not (colmap_path / "cameras.txt").exists():
-        raise DatasetNotFoundError("Missing 'sparse/0/cameras.{bin,txt}' file in COLMAP dataset")
+        raise DatasetNotFoundError("Missing 'cameras.{bin,txt}' file in COLMAP reconstruction")
     if not images_path.exists():
-        raise DatasetNotFoundError("Missing 'images' folder in COLMAP dataset")
+        raise DatasetNotFoundError("Missing image folder")
 
     if (colmap_path / "cameras.bin").exists():
         colmap_cameras = read_cameras_binary(colmap_path / "cameras.bin")
     elif (colmap_path / "cameras.txt").exists():
         colmap_cameras = read_cameras_text(colmap_path / "cameras.txt")
     else:
-        raise DatasetNotFoundError("Missing 'sparse/0/cameras.{bin,txt}' file in COLMAP dataset")
+        raise DatasetNotFoundError("Missing 'cameras.{bin,txt}' file in COLMAP dataset")
 
     if not (colmap_path / "images.bin").exists() and not (colmap_path / "images.txt").exists():
-        raise DatasetNotFoundError("Missing 'sparse/0/images.{bin,txt}' file in COLMAP dataset")
+        raise DatasetNotFoundError("Missing 'images.{bin,txt}' file in COLMAP dataset")
     if (colmap_path / "images.bin").exists():
         images = read_images_binary(colmap_path / "images.bin")
     elif (colmap_path / "images.txt").exists():
         images = read_images_text(colmap_path / "images.txt")
     else:
-        raise DatasetNotFoundError("Missing 'sparse/0/images.{bin,txt}' file in COLMAP dataset")
+        raise DatasetNotFoundError("Missing 'images.{bin,txt}' file in COLMAP dataset")
 
     points3D: Optional[Dict[int, Point3D]] = None
     if load_points:
         if not (colmap_path / "points3D.bin").exists() and not (colmap_path / "points3D.txt").exists():
-            raise DatasetNotFoundError("Missing 'sparse/0/points3D.{bin,txt}' file in COLMAP dataset")
+            raise DatasetNotFoundError("Missing 'points3D.{bin,txt}' file in COLMAP dataset")
         if (colmap_path / "points3D.bin").exists():
             points3D = read_points3D_binary(colmap_path / "points3D.bin")
         elif (colmap_path / "points3D.txt").exists():
             points3D = read_points3D_text(colmap_path / "points3D.txt")
         else:
-            raise DatasetNotFoundError("Missing 'sparse/0/points3D.{bin,txt}' file in COLMAP dataset")
+            raise DatasetNotFoundError("Missing 'points3D.{bin,txt}' file in COLMAP dataset")
 
     # Convert to tensors
     camera_intrinsics = []

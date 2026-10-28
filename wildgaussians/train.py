@@ -207,8 +207,11 @@ _CONFIG_OVERRIDES = {
 
 
 @click.command("train")
-@click.option("--data", type=str, required=True)
+@click.option("--data", type=str, default=None, help="Base data directory (assumes images/ and sparse/0/ subdirs)")
+@click.option("--images-path", type=str, default=None, help="Path to images directory (must be used with --colmap-path)")
+@click.option("--colmap-path", type=str, default=None, help="Path to COLMAP sparse directory (must be used with --images-path)")
 @click.option("--output", type=str, default=".")
+@click.option("--downscale-factor", type=int, default=None, help="Downscale factor for input images (e.g., 2 for half resolution)")
 @click.option("--verbose", "-v", is_flag=True)
 @click.option("--debug", is_flag=True)
 @click.option("--dataset-type", type=click.Choice(["default", "nerfonthego", "phototourism"]), default="default")
@@ -216,13 +219,29 @@ _CONFIG_OVERRIDES = {
 @click.option("--set", "config_overrides", help="Override a parameter in the method.", type=SetParamOptionType(), multiple=True, default=None)
 def train_command(
     data,
+    images_path,
+    colmap_path,
     output,
     verbose,
     eval_few_iters,
     dataset_type="default",
     config_overrides=None,
     debug=False,
+    downscale_factor=None
 ):
+    # Validate that either --data or both --images-path and --colmap-path are provided
+    if data is None and (images_path is None or colmap_path is None):
+        raise click.UsageError(
+            "Either --data must be provided (using default images/ and sparse/0/ subdirs), "
+            "or both --images-path and --colmap-path must be provided (with independent paths)"
+        )
+
+    if data is not None and (images_path is not None or colmap_path is not None):
+        raise click.UsageError(
+            "Cannot use --data together with --images-path or --colmap-path. "
+            "Use either --data alone or both --images-path and --colmap-path"
+        )
+
     if debug:
         import torch
         torch.autograd.set_detect_anomaly(True)  # type: ignore[attr-defined]
@@ -251,20 +270,40 @@ def train_command(
             download_dataset_fn=download_phototourism_dataset,
             evaluation_protocol=evaluation_protocol.get_name(),
         )
+        path_for_dataset = data
     else:
         if dataset_type == "nerfonthego":
             assert config_overrides["config"] == "nerfonthego.yml"
         from .datasets.colmap import load_colmap_dataset
         evaluation_protocol = DefaultEvaluationProtocol()
+
+        # Use custom paths if provided, otherwise use data with defaults
+        if images_path is not None and colmap_path is not None:
+            path_for_dataset = "."  # Use current working directory as base
+            kwargs = {
+                "images_path": images_path,
+                "colmap_path": colmap_path,
+            }
+        else:
+            path_for_dataset = data
+            kwargs = {}
+
         load_dataset_fn = partial(
-            load_dataset, 
-            load_dataset_fn=load_colmap_dataset, 
-            images_path="images",
-            evaluation_protocol=evaluation_protocol.get_name()
+            load_dataset,
+            load_dataset_fn=load_colmap_dataset,
+            evaluation_protocol=evaluation_protocol.get_name(),
+            **kwargs
         )
 
-    test_dataset = load_dataset_fn(data, "test", features, load_features=False)
-    train_dataset = load_dataset_fn(data, "train", features, load_features=False)
+    test_dataset = load_dataset_fn(path_for_dataset, "test", features, load_features=False)
+    train_dataset = load_dataset_fn(path_for_dataset, "train", features, load_features=False)
+
+    # Apply downscale factor if specified
+    if downscale_factor is not None and downscale_factor > 1:
+        logging.info(f"Applying downscale factor of {downscale_factor}")
+        test_dataset["metadata"]["downscale_loaded_factor"] = downscale_factor
+        train_dataset["metadata"]["downscale_loaded_factor"] = downscale_factor
+
     if dataset_type == "nerfonthego":
         dataset_not_official = "Please use the dataset provided for the WG paper"
         assert os.path.exists(os.path.join(data, "nb-info.json")), dataset_not_official
@@ -328,15 +367,15 @@ def train_command(
                     event.add_scalar(f"train/{k}", val)
             pbar.set_postfix({ "train/loss": f"{acc_metrics_values['loss']:.4f}", "psnr": f"{acc_metrics_values['psnr']:.4f}" })
 
-        if step % 10_000 == 0:
-            path = output_path / f"checkpoint-{step}"  # pyright: ignore[reportCallIssue]
-            if path.exists():
-                shutil.rmtree(path)
-                logging.warning(f"removed existing checkpoint at {path}")
-            method.save(str(path))
-            with open(path / "nb-info.json", "w") as f:
-                json.dump({ "method": "wild-gaussians" }, f)
-            logging.info(f"checkpoint saved at step={step}")
+        # if step % 10_000 == 0:
+        #     path = output_path / f"checkpoint-{step}"  # pyright: ignore[reportCallIssue]
+        #     if path.exists():
+        #         shutil.rmtree(path)
+        #         logging.warning(f"removed existing checkpoint at {path}")
+        #     method.save(str(path))
+        #     with open(path / "nb-info.json", "w") as f:
+        #         json.dump({ "method": "wild-gaussians" }, f)
+        #     logging.info(f"checkpoint saved at step={step}")
 
         if step in eval_few_iters:
             logging.info(f"evaluating on few images at step {step}")
@@ -365,15 +404,15 @@ def train_command(
         eval_all(method, logger, train_dataset, split="train", step=step, output=str(output_path), evaluation_protocol=evaluation_protocol, nb_info={})
 
     # Save final checkpoint
-    if step % 10_000 != 0:
-        path = output_path / f"checkpoint-{step}"  # pyright: ignore[reportCallIssue]
-        if path.exists():
-            path.unlink()
-            logging.warning(f"removed existing checkpoint at {path}")
-        method.save(str(path))
-        with open(path / "nb-info.json", "w") as f:
-            json.dump({ "method": "wild-gaussians" }, f)
-        logging.info(f"checkpoint saved at step={step}")
+    # if step % 10_000 != 0:
+    path = output_path / f"checkpoint-{step}"  # pyright: ignore[reportCallIssue]
+    if path.exists():
+        path.unlink()
+        logging.warning(f"removed existing checkpoint at {path}")
+    method.save(str(path))
+    with open(path / "nb-info.json", "w") as f:
+        json.dump({ "method": "wild-gaussians" }, f)
+    logging.info(f"checkpoint saved at step={step}")
 
 
 if __name__ == "__main__":
