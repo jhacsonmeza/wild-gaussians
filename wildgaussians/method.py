@@ -1026,6 +1026,37 @@ class GaussianModel(nn.Module):
             self.embeddings.data.copy_(embeddings)
         self.max_radii2D.fill_(0.0)
 
+
+    @torch.no_grad()
+    def initialize_from_ply(self, path, spatial_lr_scale):
+        v = PlyData.read(path)["vertex"]
+        names = [p.name for p in v.properties]
+        xyz = np.stack([v["x"], v["y"], v["z"]], 1).astype(np.float32)
+        n = len(xyz)
+
+        # Sets up buffers, Fourier embeddings, spatial_lr_scale, etc.
+        self.initialize_from_points3D(xyz, np.zeros((n, 3), np.uint8),
+                                      spatial_lr_scale, opacities=np.full(n, 0.1))
+        if len(v.properties) > 6:
+            dev = self.xyz.device
+            T = lambda a: torch.from_numpy(np.ascontiguousarray(a)).float().to(dev)
+
+            self.features_dc.data.copy_(T(np.stack([v[f"f_dc_{i}"] for i in range(3)], 1)))
+            if self.features_rest is not None:
+                k = self.features_rest.shape[1]                      # 45 for sh_degree=3
+                rest = sorted([x for x in names if x.startswith("f_rest_")],
+                              key=lambda s: int(s.rsplit("_", 1)[1]))
+                assert len(rest) == k, f"ply has {len(rest)} f_rest, model expects {k}"
+                fr = np.stack([v[x] for x in rest], 1)
+                fr = fr.reshape(n, 3, k // 3).transpose(0, 2, 1).reshape(n, k)  # (3,15)->(15,3)
+                self.features_rest.data.copy_(T(fr))
+            self.scales.data.copy_(T(np.stack([v[f"scale_{i}"] for i in range(3)], 1)))
+            self.rotations.data.copy_(T(np.stack([v[f"rot_{i}"] for i in range(4)], 1)))
+            self.opacities.data.copy_(T(v["opacity"][:, None]))
+            self.active_sh_degree.fill_(self.config.sh_degree)       # don't restart SH warm-up
+            self._setup_optimizers()
+
+
     def _setup_optimizers(self):
         config = self.config
         spatial_lr_scale = self.spatial_lr_scale.cpu().item()
@@ -1117,13 +1148,13 @@ class GaussianModel(nn.Module):
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
         # Resize all buffers to match the new state_dict
         self._resize_parameters(state_dict["xyz"].shape[0])
-        if self.appearance_embeddings is not None:
+        if "appearance_embeddings" in state_dict and self.appearance_embeddings is not None:
             self._resize_parameter("appearance_embeddings", state_dict["appearance_embeddings"].shape)
         optimizer = state_dict.pop("optimizer")
         if strict and optimizer is None:
             missing_keys.append("optimizer")
         super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
-        if self.optimizer is not None:
+        if self.optimizer is not None and "appearance_embeddings" in state_dict:
             self.optimizer.load_state_dict(optimizer)
         else:
             self._optimizer_state = optimizer
@@ -1648,26 +1679,41 @@ class WildGaussians(Method):
         load_state_dict = None
         self.config: Config = OmegaConf.structured(Config)
         self._loaded_step = None
+        # Work on a copy so we never mutate the caller's dict
+        config_overrides = dict(config_overrides) if config_overrides is not None else None
+
         if checkpoint is not None:
             if not os.path.exists(checkpoint):
                 raise RuntimeError(f"Model directory {checkpoint} does not exist")
-            logging.info(f"Loading config file {os.path.join(checkpoint, 'config.yaml')}")
-            self.config = cast(Config, OmegaConf.merge(self.config, OmegaConf.load(os.path.join(checkpoint, "config.yaml"))))
-            self._loaded_step = self.step = sorted(int(x[x.find("-") + 1 : x.find(".")]) for x in os.listdir(str(self.checkpoint)) if x.startswith("chkpnt-"))[-1]
-            state_dict_name = f"chkpnt-{self._loaded_step}.pth"
-            load_state_dict = torch.load(os.path.join(checkpoint, state_dict_name))
+
+            if os.path.isdir(checkpoint):
+                logging.info(f"Loading config file {os.path.join(checkpoint, 'config.yaml')}")
+                self.config = cast(Config, OmegaConf.merge(self.config, OmegaConf.load(os.path.join(checkpoint, "config.yaml"))))
+                self._loaded_step = self.step = sorted(int(x[x.find("-") + 1 : x.find(".")]) for x in os.listdir(str(self.checkpoint)) if x.startswith("chkpnt-"))[-1]
+                state_dict_name = f"chkpnt-{self._loaded_step}.pth"
+                load_state_dict = torch.load(os.path.join(checkpoint, state_dict_name))
+            elif os.path.isfile(checkpoint):
+                if os.path.splitext(checkpoint)[1].lower() != ".ply":
+                    raise RuntimeError(f"Checkpoint {checkpoint} is not a .ply file.")
+
+            # The checkpoint's config.yaml is the base, so a base config file name makes no sense here
+            if config_overrides is not None and "config" in config_overrides:
+                logging.warning("Ignoring 'config' override when loading from a checkpoint")
+                config_overrides.pop("config")
         else:
             if config_overrides is not None:
-                if "config" in config_overrides:
-                    config_overrides = dict(config_overrides)
-                    config_file = config_overrides.pop("config")
-                else:
-                    config_file = "default.yml"
+                config_file = config_overrides.pop("config", "default.yml")
+            else:
+                config_file = None
+            if config_file is not None:
                 logging.info(f"Loading config file {config_file}")
                 config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs", config_file)
                 self.config = cast(Config, OmegaConf.merge(self.config, OmegaConf.load(config_file)))
-                oc_config_overrides = OmegaConf.from_dotlist([f"{k}={v}" for k, v in config_overrides.items()])
-                self.config = cast(Config, OmegaConf.merge(self.config, oc_config_overrides))
+
+        # Apply the individual overrides on top, for both fresh training and checkpoint loading
+        if config_overrides:
+            oc_config_overrides = OmegaConf.from_dotlist([f"{k}={v}" for k, v in config_overrides.items()])
+            self.config = cast(Config, OmegaConf.merge(self.config, oc_config_overrides))
 
         self._viewpoint_stack = []
 
@@ -1688,7 +1734,15 @@ class WildGaussians(Method):
         if train_dataset is not None:
             self._setup_train(train_dataset, load_state_dict)
         elif load_state_dict is not None:
-            self.model.load_state_dict(load_state_dict)
+            # self.model.load_state_dict(load_state_dict)
+            result = self.model.load_state_dict(load_state_dict, strict=False)
+            allowed = ("appearance", "embeddings")  # adjust to match the names of your appearance-related params/modules
+            bad_missing = [k for k in result.missing_keys if not any(a in k for a in allowed)]
+            if bad_missing or result.unexpected_keys:
+                raise RuntimeError(f"Checkpoint mismatch. Missing: {bad_missing}, unexpected: {result.unexpected_keys}")
+            if result.missing_keys:
+                self.model.set_num_training_images(len(train_dataset["cameras"]))
+                logging.info(f"Newly initialized (not in checkpoint): {result.missing_keys}")
 
     def _setup_train(self, train_dataset: Dataset, load_state_dict):
         points3D_xyz = train_dataset["points3D_xyz"]
@@ -1731,7 +1785,19 @@ class WildGaussians(Method):
             self.model.initialize_from_points3D(xyz, colors, self.cameras_extent, opacities=opacities)
             self.model.set_num_training_images(len(train_dataset["cameras"]))
         else:
-            self.model.load_state_dict(load_state_dict)
+            if os.path.isdir(self.checkpoint):
+                result = self.model.load_state_dict(load_state_dict, strict=False)
+                allowed = ("appearance", "embeddings")  # adjust to match the names of your appearance-related params/modules
+                bad_missing = [k for k in result.missing_keys if not any(a in k for a in allowed)]
+                if bad_missing or result.unexpected_keys:
+                    raise RuntimeError(f"Checkpoint mismatch. Missing: {bad_missing}, unexpected: {result.unexpected_keys}")
+                if result.missing_keys:
+                    self.model.set_num_training_images(len(train_dataset["cameras"]))
+                    logging.info(f"Newly initialized (not in checkpoint): {result.missing_keys}")
+
+            elif os.path.isfile(self.checkpoint):
+                self.model.initialize_from_ply(self.checkpoint, self.cameras_extent)
+                self.model.set_num_training_images(len(train_dataset["cameras"]))
 
         self._viewpoint_stack = []
 

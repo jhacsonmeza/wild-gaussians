@@ -210,6 +210,7 @@ _CONFIG_OVERRIDES = {
 @click.option("--data", type=str, default=None, help="Base data directory (assumes images/ and sparse/0/ subdirs)")
 @click.option("--images-path", type=str, default=None, help="Path to images directory (must be used with --colmap-path)")
 @click.option("--colmap-path", type=str, default=None, help="Path to COLMAP sparse directory (must be used with --images-path)")
+@click.option("--checkpoint", type=str, default=None, help="Path to a saved checkpoint to continue training from.")
 @click.option("--output", type=str, default=".")
 @click.option("--downscale-factor", type=int, default=None, help="Downscale factor for input images (e.g., 2 for half resolution)")
 @click.option("--verbose", "-v", is_flag=True)
@@ -221,6 +222,7 @@ def train_command(
     data,
     images_path,
     colmap_path,
+    checkpoint,
     output,
     verbose,
     eval_few_iters,
@@ -334,7 +336,8 @@ def train_command(
     test_dataset_eval_few = datasets.dataset_index_select(test_dataset, [0, 1, 2, 3])
 
     method = WildGaussians(
-        checkpoint=None,
+        checkpoint=checkpoint if checkpoint else None,
+        # train_dataset=None if checkpoint else train_dataset,
         train_dataset=train_dataset,
         config_overrides=config_overrides,
     )
